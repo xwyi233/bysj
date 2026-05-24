@@ -3,95 +3,136 @@ JSP Environment for Train Timetabling Problem
 """
 import torch
 import numpy as np
-import torch.nn as nn
-from torch.distributions import Categorical
-
 
 class JSP_Env:
     def __init__(self, n_jobs, n_machines, processing_time_matrix,
-                 job_op_sequences, device='cuda'):
-        """
-        Args:
-            n_jobs: 列车数量（工件数）
-            n_machines: 区间/车站数量（机器数）
-            processing_time_matrix: [n_jobs, max_ops_per_job] 每个工序的加工时间
-            job_op_sequences: [n_jobs, max_ops_per_job] 每个工序对应的机器ID（固定分配）
-            device: 'cuda' or 'cpu'
-        """
+                 job_op_sequences, maintenance_job_ids=None, passenger_job_ids=None, train_priorities=None, station_capacities=None,
+                 planned_departures=None, min_stop_times=None, device='cuda'):
         self.n_jobs = n_jobs
         self.n_machines = n_machines
         self.device = device
 
-        # JSP参数：每个工序有固定的机器和加工时间
-        self.processing_time = processing_time_matrix  # [n_jobs, max_ops]
-        self.op_machine_assign = job_op_sequences  # [n_jobs, max_ops] 固定机器分配
+        self.processing_time = processing_time_matrix
+        self.op_machine_assign = job_op_sequences
 
         self.max_ops = processing_time_matrix.shape[1]
-        
-        # 追踪间隔参数
-        self.min_headway_normal = 3  # 普通列车间隔 3min
-        self.min_headway_maintenance = 120 # 天窗列车间隔 120min
-        self.maintenance_job_id = 4  # 假设第5列车（索引4）是天窗
-        
-        # 状态变量
+
+        # --- 动态推算区间与车站数量 ---
+        self.n_sections = self.n_machines // 2
+        self.n_stations = self.n_sections + 1
+
+        # 追踪与天窗基础参数，根据铁路行车组织规则，V型天窗前后列车安全间隔设置为 15 分钟
+        self.min_headway_maintenance = 15
+
+        self.maintenance_job_ids = maintenance_job_ids if maintenance_job_ids is not None else []
+        self.passenger_job_ids = passenger_job_ids if passenger_job_ids is not None else [] # === 新增：旅客列车ID集合 ===
+
+        # 车站安全间隔时间约束 (单位: min)
+        self.interval_DD = 240 / 60.0  # 到到 4.0 min
+        self.interval_DT = 180 / 60.0  # 到通 3.0 min
+        self.interval_FF = 240 / 60.0  # 发发 4.0 min
+        self.interval_FT = 300 / 60.0  # 发通 5.0 min
+        self.interval_TT = 180 / 60.0  # 通通 3.0 min
+        self.interval_TF = 90 / 60.0   # 通发 1.5 min
+        self.interval_TD = 240 / 60.0  # 通到 4.0 min
+
+        # 建立状态组合与安全间隔的映射字典
+        self.intervals = {
+            'FF': self.interval_FF, 'FT': self.interval_FT, 'TF': self.interval_TF, 'TT': self.interval_TT,
+            'DD': self.interval_DD, 'DT': self.interval_DT, 'TD': self.interval_TD
+        }
+
+        # --- 动态生成机器ID对应的物理起止车站映射 ---
+        self.machine_to_stations = {}
+        for m in range(self.n_sections):
+            self.machine_to_stations[m] = (m, m + 1)
+            opp_m = self.n_machines - 1 - m
+            self.machine_to_stations[opp_m] = (m + 1, m)
+
+        # 列车等级权重 Wi
+        self.W = train_priorities if train_priorities is not None else np.ones(n_jobs)
+
+        # 动态生成车站到发线容量
+        self.station_capacities = station_capacities if station_capacities is not None else {i: 2 for i in range(self.n_stations)}
+
+        # 计划始发时间
+        self.planned_departures = planned_departures
+
+        # 动态生成最短停站时间矩阵
+        self.min_stop_times = min_stop_times if min_stop_times is not None else np.zeros((n_jobs, self.n_stations))
+
         self.reset()
 
     def reset(self):
-        """重置环境状态"""
-        # 每个工件的当前工序索引
         self.current_op_idx = np.zeros(self.n_jobs, dtype=int)
-
-        # 机器时间状态
         self.machine_available_time = np.zeros(self.n_machines)
-        
-        # 记录每台机器上一次的状态
         self.machine_last_job = -np.ones(self.n_machines, dtype=int)
-        self.machine_last_leave_time = np.zeros(self.n_machines) # Exit time
-        self.machine_last_enter_time = np.zeros(self.n_machines) # Enter time
-
-        # 工件完成时间
+        self.machine_last_leave_time = np.zeros(self.n_machines)
+        self.machine_last_enter_time = np.zeros(self.n_machines)
         self.job_ready_time = np.zeros(self.n_jobs)
-
-        # 完成标记
         self.completed_ops = np.zeros((self.n_jobs, self.max_ops), dtype=bool)
         self.completed_jobs = np.zeros(self.n_jobs, dtype=bool)
 
-        # 调度结果记录
-        self.schedule = {}  # (job, op) -> (machine, start, end)
+        for j in range(self.n_jobs):
+            if self.max_ops == 0 or self.op_machine_assign[j, 0] == -1:
+                self.completed_jobs[j] = True
+
+        self.schedule = {}
+        self.actual_departures = np.zeros(self.n_jobs)
+
+        self.station_records = {i: [] for i in range(self.n_stations)}
+        self.section_records = {i: [] for i in range(self.n_machines)}
+
+        # 添加episode累计变量
+        self.episode_z1 = 0.0
+        self.episode_z3 = 0.0
+
+        # 密集奖励：记录上一步的部分makespan
+        self.prev_partial_makespan = 0.0
 
         return self.get_state()
 
-    def get_state(self):
-        """
-        获取当前状态
-        返回可直接输入神经网络的状态特征
-        """
-        # 就绪工序特征 [n_jobs, 4]
-        ready_ops_features = []
+    def check_capacity_violation(self, st, new_start, new_end):
+        events = []
+        for s, e in self.station_records[st]:
+            if e > s:
+                events.append((s, 1))
+                events.append((e, -1))
+        if new_end > new_start:
+            events.append((new_start, 1))
+            events.append((new_end, -1))
 
+        events.sort(key=lambda x: (x[0], x[1]))
+        max_concurrent = 0
+        current = 0
+        for t, change in events:
+            current += change
+            if current > max_concurrent:
+                max_concurrent = current
+
+        return max_concurrent > self.station_capacities.get(st, 2)
+
+    def get_state(self):
+        ready_ops_features = []
         for job_id in range(self.n_jobs):
             if self.completed_jobs[job_id]:
-                # 工件已完成
                 ready_ops_features.append([0, 0, 0, 0])
             else:
                 op_idx = self.current_op_idx[job_id]
                 machine_id = self.op_machine_assign[job_id, op_idx]
                 proc_time = self.processing_time[job_id, op_idx]
-
-                # 特征：工件ID, 工序ID, 机器ID, 加工时间
                 ready_ops_features.append([
-                    job_id / self.n_jobs,  # 归一化工件ID
-                    op_idx / self.max_ops,  # 归一化工序序号
-                    machine_id / self.n_machines,  # 归一化机器ID
-                    proc_time / 100.0  # 归一化加工时间（假设最大100）
+                    job_id / self.n_jobs,
+                    op_idx / self.max_ops,
+                    machine_id / self.n_machines,
+                    proc_time / 100.0
                 ])
 
-        # 机器状态特征 [n_machines, 2]
         machine_features = []
         for m in range(self.n_machines):
             machine_features.append([
-                self.machine_available_time[m] / 1000.0,  # 归一化可用时间
-                0  # 预留特征
+                self.machine_available_time[m] / 1000.0,
+                0
             ])
 
         return {
@@ -101,145 +142,229 @@ class JSP_Env:
         }
 
     def get_action_mask(self):
-        """
-        获取动作掩码：标记哪些工件的就绪工序可以选择
-        Returns: [n_jobs] 的bool mask，True表示该工件的就绪工序可选
-        """
         mask = np.zeros(self.n_jobs, dtype=bool)
-
         for job_id in range(self.n_jobs):
             if not self.completed_jobs[job_id]:
-                op_idx = self.current_op_idx[job_id]
-                machine_id = self.op_machine_assign[job_id, op_idx]
-
-                # JSP中只要机器空闲就可以选择（简化约束）
-                # 实际运行图可能需要考虑区间占用冲突，这里简化处理
                 mask[job_id] = True
-
         return torch.BoolTensor(mask).to(self.device)
 
+    def get_makespan(self):
+        regular_jobs_ready_time = []
+        for j in range(self.n_jobs):
+            if j not in self.maintenance_job_ids:
+                regular_jobs_ready_time.append(self.job_ready_time[j])
+        if not regular_jobs_ready_time:
+            return 0
+        return max(regular_jobs_ready_time)
+
+    def get_partial_makespan(self):
+        """计算当前部分调度的makespan（包括已完成和进行中的任务）"""
+        regular_times = []
+        for j in range(self.n_jobs):
+            if j not in self.maintenance_job_ids:
+                # 如果任务已完成，用完成时间；否则用当前已调度的时间
+                if self.completed_jobs[j]:
+                    regular_times.append(self.job_ready_time[j])
+                elif self.job_ready_time[j] > 0:  # 至少调度了一部分
+                    regular_times.append(self.job_ready_time[j])
+
+        if not regular_times:
+            return 0
+        return max(regular_times)
+
     def step(self, job_id):
-        """
-        执行动作：为指定工件调度其当前就绪工序
+        job_id = int(job_id)
 
-        Args:
-            job_id: 选择的工件ID（0到n_jobs-1）
+        if self.completed_jobs[job_id]:
+            done = np.all(self.completed_jobs)
+            return self.get_state(), -10.0, done, {'makespan': self.get_makespan(), 'scheduled': None}
 
-        Returns:
-            next_state, reward, done, info
-        """
         op_idx = self.current_op_idx[job_id]
         machine_id = self.op_machine_assign[job_id, op_idx]
+
+        if machine_id == -1:
+            self.completed_jobs[job_id] = True
+            done = np.all(self.completed_jobs)
+            return self.get_state(), -10.0, done, {'makespan': self.get_makespan(), 'scheduled': None}
+
         proc_time = self.processing_time[job_id, op_idx]
+        opp_machine_id = self.n_machines - 1 - machine_id
+        is_curr_maintenance = (job_id in self.maintenance_job_ids)
 
-        # ------------------------------------------------------------------
-        # 1. 确定机器可用时间（Machine Availability）
-        # ------------------------------------------------------------------
-        # 在标准JSP中，机器可用时间是上一工序完成时间。
-        # 但为了模拟“追踪间隔”，我们需要区分：
-        #   (a) 物理占用释放时间（Physically Free Time）：列车离开区间/车站的时间
-        #   (b) 下一列车允许进入时间（Next Train Entry Time）：
-        #       - 如果上一列车是普通列车：Entry Time >= 上一列车Entry Time + 3 min
-        #       - 如果上一列车是天窗（T4）：Entry Time >= 上一列车Exit Time + 120 min (严禁进入 -> 独占)
-        #       - 如果当前列车是天窗（T4）：Entry Time >= 上一列车Exit Time (需要清空区间)
-        
-        # 我们使用 self.machine_available_time 来存储 "允许下一列车进入的最早时间"
-        # 同时我们需要记录 "上一列车实际离开时间" (physical release time)
-        
-        # 获取当前机器的状态记录
-        last_job = self.machine_last_job[machine_id]
-        last_leave_time = self.machine_last_leave_time[machine_id] # 这里存储的是Exit Time (End Time)
-        last_enter_time = self.machine_last_enter_time[machine_id] # 新增：记录上一列车Enter Time (Start Time)
-        
-        # 计算基于机器占用的最早开始时间
-        machine_ready_time = 0
-        
-        if last_job != -1:
-            # 判断上一列车类型
-            is_last_maintenance = (last_job == self.maintenance_job_id)
-            # 判断当前列车类型
-            is_curr_maintenance = (job_id == self.maintenance_job_id)
-            
-            if is_curr_maintenance:
-                # 当前是天窗：必须等上一列车完全离开，且可能需要额外确认（这里假设离开即可）
-                # 严禁任何列车进入 -> 天窗需要独占
-                machine_ready_time = last_leave_time
-            elif is_last_maintenance:
-                # 上一列车是天窗：当前列车必须等天窗结束后 120 min 才能进入
-                machine_ready_time = last_leave_time + self.min_headway_maintenance
+        ready_t = self.job_ready_time[job_id]
+        start_st, end_st = self.machine_to_stations[machine_id]
+
+        min_stop = self.min_stop_times[job_id, start_st] if op_idx > 0 else 0
+        start_time = ready_t + min_stop
+
+        # 启发式快速推进
+        last_j = self.machine_last_job[machine_id]
+        if last_j != -1:
+            last_enter = self.machine_last_enter_time[machine_id]
+            last_leave = self.machine_last_leave_time[machine_id]
+
+            if last_j in self.maintenance_job_ids or is_curr_maintenance:
+                start_time = max(start_time, last_leave + self.min_headway_maintenance)
             else:
-                # 上一列车是普通列车，当前也是普通列车
-                # 追踪间隔 3 min (相对于上一列车进入时间)
-                # 但同时也必须等上一列车离开吗？
-                # 如果是区间（单线闭塞），通常必须等上一列车离开（或者分区块）。
-                # 题目说 "列车1、2、3、4的追踪间隔为3min"。
-                # 如果区间运行时间是15min，间隔3min意味着区间内可以有多列车（移动闭塞或多分区）。
-                # 因此，我们允许 "Entry Time >= Last Entry Time + 3"
-                # 且 "Entry Time >= Last Leave Time" (如果单闭塞) OR 忽略Leave Time constraint (如果多闭塞)
-                # 鉴于题目强调3min间隔，这通常指发车间隔。我们假设区间容量足够（虚拟分区）。
-                # 所以主要约束是 headway。
-                
-                # 但是，为了防止物理碰撞（后车追前车），如果后车比前车快，或者出站受阻，需要考虑。
-                # 这里所有普通列车速度相同（120km/h），所以只要满足进入间隔，区间内就不会追尾。
-                machine_ready_time = last_enter_time + self.min_headway_normal
-                
-                # 修正：虽然间隔满足，但如果上一列车还没走完，JSP模型默认是冲突的。
-                # 为了在JSP框架下实现这一点，我们认为机器的 "availability" 是虚拟的 token availability.
-                # 但 vis_utils 画图时可能会画出重叠。
-                # 如果用户接受区间内多列车，则允许重叠。
-                pass
+                dir_curr = job_id % 2
+                dir_last = last_j % 2
+                if dir_curr == dir_last:
+                    hw = max(self.interval_FF, self.interval_FT, self.interval_TF, self.interval_TT)
+                else:
+                    hw = max(self.interval_DD, self.interval_DT, self.interval_TD)
+                start_time = max(start_time, last_enter + hw)
 
-        # 综合考虑工件就绪时间
-        start_time = max(machine_ready_time, self.job_ready_time[job_id])
+        if is_curr_maintenance:
+            last_j_opp = self.machine_last_job[opp_machine_id]
+            if last_j_opp != -1:
+                start_time = max(start_time, self.machine_last_leave_time[opp_machine_id] + self.min_headway_maintenance)
+
+        conflict = True
+        while conflict:
+            conflict = False
+
+            curr_event_start = 'F' if (op_idx == 0 or min_stop > 0 or start_time > ready_t) else 'T'
+            curr_event_end = 'D' if (op_idx == self.max_ops - 1 or self.min_stop_times[job_id, end_st] > 0) else 'T'
+            end_time = start_time + proc_time
+
+            for s_prev, e_prev, j_prev, prev_event_start, prev_event_end in self.section_records[machine_id]:
+                is_j_maint = (j_prev in self.maintenance_job_ids)
+                if is_curr_maintenance or is_j_maint:
+                    hw = self.min_headway_maintenance
+                    if not (end_time <= s_prev or start_time >= e_prev + hw):
+                        start_time = max(start_time, e_prev + hw)
+                        conflict = True
+                        break
+                else:
+                    if start_time >= s_prev:
+                        hw_start = self.intervals[prev_event_start + curr_event_start]
+                        if start_time < s_prev + hw_start:
+                            start_time = s_prev + hw_start
+                            conflict = True
+                            break
+
+                        hw_end = self.intervals[prev_event_end + curr_event_end]
+                        if end_time < e_prev + hw_end:
+                            start_time = e_prev + hw_end - proc_time
+                            conflict = True
+                            break
+                    else:
+                        hw_start = self.intervals[curr_event_start + prev_event_start]
+                        if s_prev < start_time + hw_start:
+                            start_time = s_prev + self.intervals[prev_event_start + curr_event_start]
+                            conflict = True
+                            break
+
+                        hw_end = self.intervals[curr_event_end + prev_event_end]
+                        if e_prev < end_time + hw_end:
+                            start_time = s_prev + self.intervals[prev_event_start + curr_event_start]
+                            conflict = True
+                            break
+
+            if conflict: continue
+
+            for s_prev, e_prev, j_prev, _, _ in self.section_records[opp_machine_id]:
+                is_j_maint = (j_prev in self.maintenance_job_ids)
+                if is_curr_maintenance or is_j_maint:
+                    hw = self.min_headway_maintenance
+                    if not (end_time <= s_prev or start_time >= e_prev + hw):
+                        start_time = max(start_time, e_prev + hw)
+                        conflict = True
+                        break
+
+        final_event_start = 'F' if (op_idx == 0 or min_stop > 0 or start_time > ready_t) else 'T'
+        final_event_end = 'D' if (op_idx == self.max_ops - 1 or self.min_stop_times[job_id, end_st] > 0) else 'T'
         end_time = start_time + proc_time
 
-        # 更新状态
+        waiting_time = max(0, start_time - ready_t - min_stop)
+        step_penalty = 0.0
+
+        if start_time > ready_t:
+            if self.check_capacity_violation(start_st, ready_t, start_time):
+                step_penalty -= 500.0
+            self.station_records[start_st].append((ready_t, start_time))
+
+        if op_idx == 0 and not is_curr_maintenance:
+            self.actual_departures[job_id] = start_time
+
+        self.section_records[machine_id].append((start_time, end_time, job_id, final_event_start, final_event_end))
+
+        if is_curr_maintenance:
+            self.section_records[opp_machine_id].append((start_time, end_time, job_id, final_event_start, final_event_end))
+
         self.schedule[(job_id, op_idx)] = (machine_id, start_time, end_time)
-        
-        # 更新机器状态
+
         self.machine_last_job[machine_id] = job_id
         self.machine_last_leave_time[machine_id] = end_time
         self.machine_last_enter_time[machine_id] = start_time
-        
-        # 更新机器可用时间（供下一次step使用）
-        # 这里其实不需要显式维护 machine_available_time 数组作为唯一标准，
-        # 因为我们已经通过 last_job 等变量动态计算了。
-        # 但为了兼容旧代码的 reset/get_state，我们还是更新它。
-        # 注意：get_state 中的 machine available time 特征可能需要调整，但在RL中让它自己学吧。
-        self.machine_available_time[machine_id] = end_time # 仅作为参考，实际逻辑已在上面重写
+        self.machine_available_time[machine_id] = end_time
+
+        if is_curr_maintenance:
+            self.machine_last_job[opp_machine_id] = job_id
+            self.machine_last_leave_time[opp_machine_id] = end_time
+            self.machine_last_enter_time[opp_machine_id] = start_time
+            self.machine_available_time[opp_machine_id] = end_time
 
         self.job_ready_time[job_id] = end_time
         self.completed_ops[job_id, op_idx] = True
 
-        # 移动到下一工序
         self.current_op_idx[job_id] += 1
+
         if self.current_op_idx[job_id] >= self.max_ops or \
-                self.processing_time[job_id, self.current_op_idx[job_id]] == 0 or \
                 self.op_machine_assign[job_id, self.current_op_idx[job_id]] == -1:
             self.completed_jobs[job_id] = True
 
-        # 计算奖励
-        reward = self._compute_reward()
         done = np.all(self.completed_jobs)
 
-        return self.get_state(), reward, done, {
-            'makespan': max(self.job_ready_time), # 使用所有列车完成时间的最大值更准确
-            'scheduled': (job_id, op_idx, machine_id, start_time, end_time)
+        if not is_curr_maintenance:
+            # z1: 加权旅行时间（累计，不立即作为奖励）
+            self.episode_z1 += self.W[job_id] * (proc_time + min_stop + waiting_time)
+            # z3: 等待时间（累计）
+            self.episode_z3 += waiting_time
+
+        # ========== 密集奖励核心修改 ==========
+        # 计算当前部分makespan
+        current_partial_makespan = self.get_partial_makespan()
+
+        # 计算改进量（上一步 - 当前步，正值表示makespan减小，是改进）
+        if self.prev_partial_makespan > 0:  # 不是第一步
+            improvement = self.prev_partial_makespan - current_partial_makespan
+            # 改进为正，给予正奖励；改进为负（恶化），给予负奖励
+            dense_reward = improvement / 100.0
+        else:
+            dense_reward = 0
+
+        # 更新上一步记录
+        self.prev_partial_makespan = current_partial_makespan
+
+        # 组合奖励：密集奖励 + 惩罚项
+        reward = dense_reward + step_penalty
+
+        # 初始化info字典
+        info = {
+            'makespan': self.get_makespan(),
+            'scheduled': (job_id, op_idx, machine_id, start_time, end_time) if not done else None
         }
 
-    def _compute_reward(self):
-        """
-        奖励函数：鼓励减小makespan
-        可以使用多种奖励设计：
-        1. 每步奖励：-当前最大完成时间增量
-        2. 稀疏奖励：只有结束时给 -makespan
-        3. 基于空闲时间的奖励
-        """
-        # 简单版本：结束时的负makespan，中间步骤奖励为0
-        if np.all(self.completed_jobs):
-            return -max(self.machine_available_time) / 100.0  # 归一化
-        return 0.0
+        if done:
+            # 计算z2: 发车间隔差异
+            reg_deps = [self.actual_departures[j] for j in range(self.n_jobs) if j not in self.maintenance_job_ids]
+            z2 = 0.0
+            if len(reg_deps) > 1:
+                reg_deps = np.sort(reg_deps)
+                z2 = np.sum(np.abs(np.diff(reg_deps)))
 
-    def get_makespan(self):
-        """获取当前makespan"""
-        return max(self.machine_available_time)
+            # 总makespan = z1 + z2 + z3
+            total_makespan = self.episode_z1 + z2 + self.episode_z3
+
+            # 最终奖励：用真实makespan替换密集奖励，确保与目标一致
+            final_reward = -total_makespan / 1000.0
+
+            # 可选：混合密集奖励和最终奖励
+            # reward = 0.5 * reward + 0.5 * final_reward  # 保留部分密集信号
+            reward = final_reward  # 纯最终奖励（推荐先尝试这个）
+
+            # 更新info为真实makespan
+            info['makespan'] = total_makespan
+
+        return self.get_state(), reward, done, info
